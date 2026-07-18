@@ -224,7 +224,7 @@ http_client: httpx.AsyncClient | None = None
 
 LINKS: dict = {}
 LINKS_LOCK = asyncio.Lock()
-CUSTOM_ADDRESSES: list = ["www.speedtest.net"]
+CUSTOM_ADDRESSES: list = []
 CUSTOM_ADDRESSES_LOCK = asyncio.Lock()
 
 notified_uids = set()
@@ -232,7 +232,127 @@ notified_uids = set()
 SESSION_COOKIE = "ren_session"
 SESSION_TTL = 60 * 60 * 24 * 7
 UNLIMITED_QUOTA_BYTES = 53687091200000
+# پورت همیشه ثابت روی 443 است — دیگه قابل تغییر توسط کاربر نیست
 DEFAULT_PORT = 443
+MIN_PORT, MAX_PORT = 1, 65535
+
+# نوع پروتکل (auth scheme) و ترابرد به‌صورت دو بُعد جدا از هم هستن؛ کاربر برای هر
+# کانفیگ هرکدوم رو مستقل از اون یکی انتخاب می‌کنه (مثلاً Trojan + XHTTP stream-up
+# یا VLESS + WebSocket و ...). مقدار ذخیره‌شده‌ی نهایی همیشه "{auth}-{transport}"ه.
+AUTH_TYPES = ("vless", "trojan")
+DEFAULT_AUTH = "vless"
+
+TRANSPORTS = ("ws", "xhttp-packet-up", "xhttp-stream-up")
+DEFAULT_TRANSPORT = "ws"
+
+PROTOCOLS = tuple(f"{a}-{t}" for a in AUTH_TYPES for t in TRANSPORTS)
+DEFAULT_PROTOCOL = f"{DEFAULT_AUTH}-{DEFAULT_TRANSPORT}"
+
+def split_protocol(protocol: str) -> tuple[str, str]:
+    """مقدار ذخیره‌شده‌ی protocol ("auth-transport") رو به دو بخش auth/transport می‌شکونه."""
+    protocol = normalize_protocol(protocol)
+    auth, transport = protocol.split("-", 1)
+    return auth, transport
+
+def normalize_protocol(value: str | None) -> str:
+    """قدیم‌ترها مقدار protocol فقط ترابرد بود (مثلاً 'xhttp-packet-up' بدون
+    پیشوند auth) چون auth همیشه vless بود. این تابع مقادیر قدیمی رو به فرمت
+    جدید 'auth-transport' تبدیل می‌کنه تا کانفیگ‌های قبلی خراب نشن."""
+    value = (value or "").strip().lower()
+    if value in PROTOCOLS:
+        return value
+    if value in TRANSPORTS:  # legacy value با auth ضمنی vless
+        return f"vless-{value}"
+    return DEFAULT_PROTOCOL
+
+# Fingerprint (uTLS) های قابل انتخاب برای هر کانفیگ — مستقل برای هر پروتکل انتخاب می‌شه
+FINGERPRINTS = ("chrome", "firefox", "safari", "ios", "android", "edge", "360", "qq", "random", "randomized")
+DEFAULT_FINGERPRINT = "chrome"
+
+# لیست بسته‌ی ALPNهای قابل‌انتخاب (دیگه فیلد آزاد نیست) — مستقل برای هر پروتکل انتخاب می‌شه
+ALPN_OPTIONS = ("h3", "h2", "http/1.1", "h3,h2,http/1.1", "h3,h2", "h2,http/1.1")
+
+# پیش‌فرض ALPN بر اساس نوع ترابرد، وقتی کاربر مقدار انتخاب نکرده (auth روی این تاثیری نداره)
+DEFAULT_ALPN_BY_PROTOCOL = {}
+for _auth in AUTH_TYPES:
+    DEFAULT_ALPN_BY_PROTOCOL[f"{_auth}-ws"] = "http/1.1"
+    DEFAULT_ALPN_BY_PROTOCOL[f"{_auth}-xhttp-packet-up"] = "h2,http/1.1"
+    DEFAULT_ALPN_BY_PROTOCOL[f"{_auth}-xhttp-stream-up"] = "h2,http/1.1"
+del _auth
+
+# ═══════════════════ ساختار «variants» — هر لینک می‌تونه هم‌زمان هم VLESS هم Trojan ═══════════════════
+# هر لینک به‌جای یک protocol واحد، یک variant مستقل برای هر auth type داره:
+#   link["variants"] = {
+#       "vless":  {"enabled": bool, "transport": ..., "fingerprint": ..., "alpn": ...},
+#       "trojan": {"enabled": bool, "transport": ..., "fingerprint": ..., "alpn": ...},
+#   }
+# حداقل یکی از دو تا باید enabled باشه.
+
+def default_variants() -> dict:
+    return {
+        "vless": {"enabled": True, "transport": DEFAULT_TRANSPORT, "fingerprint": DEFAULT_FINGERPRINT, "alpn": DEFAULT_ALPN_BY_PROTOCOL["vless-ws"]},
+        "trojan": {"enabled": False, "transport": DEFAULT_TRANSPORT, "fingerprint": DEFAULT_FINGERPRINT, "alpn": DEFAULT_ALPN_BY_PROTOCOL["trojan-ws"]},
+    }
+
+def sanitize_variant(v: dict | None, auth: str) -> dict:
+    v = v or {}
+    transport = str(v.get("transport") or DEFAULT_TRANSPORT).strip().lower()
+    if transport not in TRANSPORTS:
+        transport = DEFAULT_TRANSPORT
+    fp = str(v.get("fingerprint") or DEFAULT_FINGERPRINT).strip().lower()
+    if fp not in FINGERPRINTS:
+        fp = DEFAULT_FINGERPRINT
+    alpn = str(v.get("alpn") or "").strip()
+    if alpn not in ALPN_OPTIONS:
+        alpn = DEFAULT_ALPN_BY_PROTOCOL.get(f"{auth}-{transport}", "http/1.1")
+    return {"enabled": bool(v.get("enabled", False)), "transport": transport, "fingerprint": fp, "alpn": alpn}
+
+def sanitize_variants(variants: dict | None) -> dict:
+    variants = variants or {}
+    result = {auth: sanitize_variant(variants.get(auth), auth) for auth in AUTH_TYPES}
+    if not any(result[a]["enabled"] for a in AUTH_TYPES):
+        result["vless"]["enabled"] = True  # حداقل یکی باید فعال بمونه
+    return result
+
+def variants_from_legacy(protocol: str, fingerprint: str, alpn: str) -> dict:
+    """کانفیگ‌های قدیمی که فقط یک protocol/fingerprint/alpn ستونی داشتن رو به فرمت جدید تبدیل می‌کنه."""
+    auth, transport = split_protocol(protocol)
+    variants = default_variants()
+    for a in AUTH_TYPES:
+        variants[a]["enabled"] = False
+    variants[auth] = {
+        "enabled": True, "transport": transport,
+        "fingerprint": fingerprint or DEFAULT_FINGERPRINT,
+        "alpn": alpn or DEFAULT_ALPN_BY_PROTOCOL.get(f"{auth}-{transport}", "http/1.1"),
+    }
+    return variants
+
+def variants_to_legacy(variants: dict) -> tuple[str, str, str]:
+    """برای پرشدن ستون‌های قدیمی protocol/fingerprint/alpn (صرفاً برای سازگاری با ابزارهای بیرونی)."""
+    for auth in AUTH_TYPES:
+        v = (variants or {}).get(auth, {})
+        if v.get("enabled"):
+            return f"{auth}-{v.get('transport', DEFAULT_TRANSPORT)}", v.get("fingerprint", DEFAULT_FINGERPRINT), v.get("alpn", "")
+    return DEFAULT_PROTOCOL, DEFAULT_FINGERPRINT, ""
+
+def variants_from_body(body: dict, base: dict | None = None) -> dict:
+    """بدنه‌ی JSON درخواست (فیلدهای vless_enabled/vless_transport/... و trojan_*) رو
+    به ساختار variants تبدیل می‌کنه. base مقادیر پیش‌فرض/موجود رو برای فیلدهایی که
+    توی body نیومدن فراهم می‌کنه (برای PATCH جزئی)."""
+    base = base or default_variants()
+    result = {}
+    for auth in AUTH_TYPES:
+        cur = dict(base.get(auth, {}))
+        if f"{auth}_enabled" in body:
+            cur["enabled"] = bool(body.get(f"{auth}_enabled"))
+        if f"{auth}_transport" in body:
+            cur["transport"] = body.get(f"{auth}_transport")
+        if f"{auth}_fingerprint" in body:
+            cur["fingerprint"] = body.get(f"{auth}_fingerprint")
+        if f"{auth}_alpn" in body:
+            cur["alpn"] = body.get(f"{auth}_alpn")
+        result[auth] = cur
+    return sanitize_variants(result)
 
 DB_FILE = "/data/panel.db" if os.path.isdir("/data") else "panel.db"
 if os.path.isdir("/data"):
@@ -457,7 +577,11 @@ def init_db():
             max_connections INTEGER DEFAULT 0,
             created_at TEXT NOT NULL,
             active INTEGER DEFAULT 1,
-            expires_at TEXT
+            expires_at TEXT,
+            protocol TEXT DEFAULT 'vless-ws',
+            fingerprint TEXT DEFAULT 'chrome',
+            alpn TEXT DEFAULT '',
+            port INTEGER DEFAULT 443
         );
         CREATE TABLE IF NOT EXISTS custom_addresses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -492,6 +616,18 @@ def init_db():
         );
     """)
     conn.commit()
+    # Migrate older DBs created before protocol/fingerprint/alpn/port existed
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(links)").fetchall()}
+    for col, ddl in (
+        ("protocol", "ALTER TABLE links ADD COLUMN protocol TEXT DEFAULT 'vless-ws'"),
+        ("fingerprint", "ALTER TABLE links ADD COLUMN fingerprint TEXT DEFAULT 'chrome'"),
+        ("alpn", "ALTER TABLE links ADD COLUMN alpn TEXT DEFAULT ''"),
+        ("port", "ALTER TABLE links ADD COLUMN port INTEGER DEFAULT 443"),
+        ("variants_json", "ALTER TABLE links ADD COLUMN variants_json TEXT DEFAULT ''"),
+    ):
+        if col not in existing_cols:
+            conn.execute(ddl)
+    conn.commit()
     # Ensure default auth row
     cur = conn.execute("SELECT password_hash FROM auth WHERE id = 1")
     row = cur.fetchone()
@@ -519,15 +655,20 @@ def migrate_json_to_sqlite():
         # Migrate links
         links = data.get("links", {})
         for uid, link in links.items():
+            variants = variants_from_legacy(link.get("protocol", DEFAULT_PROTOCOL), link.get("fingerprint", DEFAULT_FINGERPRINT), link.get("alpn", ""))
+            legacy_protocol, legacy_fp, legacy_alpn = variants_to_legacy(variants)
             conn.execute("""
-                INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, protocol, fingerprint, alpn, port, variants_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (uid, link.get("label", uid), link.get("limit_bytes", 0), link.get("used_bytes", 0),
                   link.get("max_connections", 0), link.get("created_at", datetime.now(timezone.utc).isoformat()),
-                  1 if link.get("active", True) else 0, link.get("expires_at")))
+                  1 if link.get("active", True) else 0, link.get("expires_at"),
+                  legacy_protocol, legacy_fp, legacy_alpn, link.get("port", DEFAULT_PORT),
+                  json.dumps(variants)))
             LINKS[uid] = dict(link)
+            LINKS[uid]["variants"] = variants
         # Migrate addresses
-        addresses = data.get("custom_addresses", ["www.speedtest.net"])
+        addresses = data.get("custom_addresses", [])
         CUSTOM_ADDRESSES.clear()
         for addr in addresses:
             conn.execute("INSERT OR IGNORE INTO custom_addresses (address) VALUES (?)", (addr,))
@@ -556,12 +697,16 @@ async def save_db():
             # Save links
             async with LINKS_LOCK:
                 for uid, link in list(LINKS.items()):
+                    variants = sanitize_variants(link.get("variants"))
+                    legacy_protocol, legacy_fp, legacy_alpn = variants_to_legacy(variants)
                     conn.execute("""
-                        INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT OR REPLACE INTO links (uuid, label, limit_bytes, used_bytes, max_connections, created_at, active, expires_at, protocol, fingerprint, alpn, port, variants_json)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (uid, link["label"], link["limit_bytes"], link["used_bytes"],
                           link.get("max_connections", 0), link["created_at"],
-                          1 if link.get("active", True) else 0, link.get("expires_at")))
+                          1 if link.get("active", True) else 0, link.get("expires_at"),
+                          legacy_protocol, legacy_fp, legacy_alpn, link.get("port", DEFAULT_PORT),
+                          json.dumps(variants)))
             # Save addresses
             async with CUSTOM_ADDRESSES_LOCK:
                 conn.execute("DELETE FROM custom_addresses")
@@ -589,6 +734,15 @@ def load_db():
         LINKS.clear()
         cur = conn.execute("SELECT * FROM links")
         for row in cur.fetchall():
+            variants_raw = row["variants_json"] if "variants_json" in row.keys() else None
+            variants = None
+            if variants_raw:
+                try:
+                    variants = sanitize_variants(json.loads(variants_raw))
+                except Exception:
+                    variants = None
+            if variants is None:
+                variants = variants_from_legacy(row["protocol"], row["fingerprint"], row["alpn"])
             LINKS[row["uuid"]] = {
                 "label": row["label"],
                 "limit_bytes": row["limit_bytes"],
@@ -597,6 +751,8 @@ def load_db():
                 "created_at": row["created_at"],
                 "active": bool(row["active"]),
                 "expires_at": row["expires_at"],
+                "variants": variants,
+                "port": row["port"] if row["port"] else DEFAULT_PORT,
             }
         # Load addresses
         CUSTOM_ADDRESSES.clear()
@@ -604,8 +760,12 @@ def load_db():
         rows = cur.fetchall()
         if rows:
             CUSTOM_ADDRESSES.extend(row["address"] for row in rows)
-        else:
-            CUSTOM_ADDRESSES.append("www.speedtest.net")
+        # پاک‌سازی یک‌بارمصرف: آدرس پیش‌فرض قدیمی رو دیگه نمی‌خوایم، حتی اگه از قبل
+        # تو دیتابیس ذخیره شده باشه.
+        if "www.speedtest.net" in CUSTOM_ADDRESSES:
+            CUSTOM_ADDRESSES.remove("www.speedtest.net")
+            conn.execute("DELETE FROM custom_addresses WHERE address = ?", ("www.speedtest.net",))
+            conn.commit()
         # Load settings
         cur = conn.execute("SELECT key, value FROM settings")
         for row in cur.fetchall():
@@ -709,17 +869,87 @@ def get_domain() -> str:
         .replace("https://", "").replace("http://", "")
     )
 
-def generate_vless_link(uuid: str, remark: str = "Luffy", address: str = None, port: int = None) -> str:
+def generate_vless_link(
+    uuid: str,
+    remark: str = "Luffy",
+    address: str = None,
+    port: int = None,
+    protocol: str = DEFAULT_PROTOCOL,
+    fingerprint: str | None = None,
+    alpn: str | None = None,
+) -> str:
+    """می‌سازد share-link متناسب با auth (vless/trojan) و ترابرد انتخاب‌شده
+    (ws یا یکی از دو مد XHTTP: packet-up / stream-up). fingerprint/alpn در
+    صورت ندادن، از پیش‌فرض‌های خودِ پروتکل استفاده می‌کنن. پورت همیشه 443 است
+    و پارامتر port دیگه در نظر گرفته نمی‌شه.
+
+    نکته‌ی مهم: برای هر دو auth، همون uid مخفیِ توی مسیر URL (/ws/{uid} یا
+    /xhttp/{mode}/{uid}) واقعاً احراز هویت می‌کنه، نه UUID داخل هدر VLESS یا
+    پسورد داخل هدر Trojan (که هیچ‌کدوم سمت سرور چک نمی‌شن) — پس برای Trojan هم
+    از همون uid به‌عنوان password توی لینک استفاده می‌کنیم."""
     domain = get_domain()
     addr = address if address else domain
-    use_port = port if port else DEFAULT_PORT
-    path = f"/ws/{uuid}?ed=2048"
-    params = {
-        "encryption": "none", "security": "tls", "type": "ws",
-        "host": domain, "path": path, "sni": domain, "fp": "chrome", "alpn": "http/1.1"
-    }
+
+    protocol = normalize_protocol(protocol)
+    auth, transport = split_protocol(protocol)
+
+    fp = (fingerprint or DEFAULT_FINGERPRINT).strip().lower() or DEFAULT_FINGERPRINT
+    if fp not in FINGERPRINTS:
+        fp = DEFAULT_FINGERPRINT
+
+    alpn_val = (alpn or "").strip()
+    if alpn_val not in ALPN_OPTIONS:
+        alpn_val = DEFAULT_ALPN_BY_PROTOCOL.get(protocol, "http/1.1")
+
+    # پورت ثابت و همیشه 443 — هر مقدار ورودی نادیده گرفته می‌شه
+    use_port = DEFAULT_PORT
+
+    if transport == "ws":
+        path = f"/ws/{auth}/{uuid}?ed=2048"
+        base_params = {"security": "tls", "type": "ws", "host": domain, "path": path, "sni": domain, "fp": fp, "alpn": alpn_val}
+    else:
+        # xhttp-packet-up / xhttp-stream-up
+        mode = transport.replace("xhttp-", "")  # packet-up | stream-up
+        path = f"/xhttp/{auth}/{mode}/{uuid}"
+        base_params = {"security": "tls", "type": "xhttp", "mode": mode, "host": domain, "path": path, "sni": domain, "fp": fp, "alpn": alpn_val}
+
+    if auth == "vless":
+        params = {"encryption": "none", **base_params}
+        scheme = "vless"
+    else:
+        # trojan:// user-info بخش، password هست نه uuid؛ چون سمت سرور چک نمی‌شه از
+        # همون uid استفاده می‌کنیم تا برای کاربر هم مشخص و یکتا بمونه.
+        params = base_params
+        scheme = "trojan"
+
     query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
-    return f"vless://{uuid}@{addr}:{use_port}?{query}#{quote(remark)}"
+    return f"{scheme}://{uuid}@{addr}:{use_port}?{query}#{quote(remark)}"
+
+
+def link_for_variant(link: dict, uid: str, auth: str, address: str = None) -> str | None:
+    """اگه variant مربوط به این auth (vless/trojan) روی این لینک فعال باشه، share-link
+    مربوطه رو می‌سازه؛ وگرنه None برمی‌گردونه."""
+    variant = sanitize_variants(link.get("variants")).get(auth)
+    if not variant or not variant.get("enabled"):
+        return None
+    protocol = f"{auth}-{variant['transport']}"
+    return generate_vless_link(
+        uid,
+        remark=f"Luffy-{link.get('label', '')}",
+        address=address,
+        protocol=protocol,
+        fingerprint=variant.get("fingerprint"),
+        alpn=variant.get("alpn"),
+    )
+
+def links_for_all_variants(link: dict, uid: str, address: str = None) -> list[str]:
+    """برای هر auth فعال روی این لینک، یک share-link می‌سازه (ممکنه ۱ یا ۲ تا خروجی بده)."""
+    out = []
+    for auth in AUTH_TYPES:
+        share_link = link_for_variant(link, uid, auth, address=address)
+        if share_link:
+            out.append(share_link)
+    return out
 
 def uptime() -> str:
     secs = int(time.time() - stats["start_time"])
@@ -763,6 +993,8 @@ async def ensure_default_link():
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "active": True,
                 "expires_at": None,
+                "variants": default_variants(),
+                "port": DEFAULT_PORT,
             }
 
 async def find_uid_by_label(label: str) -> str | None:
@@ -1143,10 +1375,12 @@ async def handle_create_command(text: str):
             "created_at": datetime.now(timezone.utc).isoformat(),
             "active": True,
             "expires_at": expires_at,
+            "variants": default_variants(),
+            "port": DEFAULT_PORT,
         }
 
     await save_db()
-    vless_link = generate_vless_link(uid, remark=f"Luffy-{label}", port=DEFAULT_PORT)
+    vless_link = "\n".join(links_for_all_variants(LINKS[uid], uid))
     sub_url = f"https://{get_domain()}/sub/{uid}"
 
     quota_str = _fmt_bytes(limit_bytes) if limit_bytes > 0 else L("unlimited")
@@ -1599,6 +1833,11 @@ async def create_link(request: Request, _=Depends(require_auth)):
                 expires_at = (datetime.now(timezone.utc) + timedelta(days=days_valid)).isoformat()
         except (ValueError, TypeError):
             pass
+
+    variants = variants_from_body(body)
+    # پورت همیشه 443 است؛ هر مقدار دیگه‌ای که فرانت بفرسته نادیده گرفته می‌شه
+    port = DEFAULT_PORT
+
     uid = str(uuid.uuid4())
     async with LINKS_LOCK:
         LINKS[uid] = {
@@ -1609,13 +1848,16 @@ async def create_link(request: Request, _=Depends(require_auth)):
             "created_at": datetime.now(timezone.utc).isoformat(),
             "active": True,
             "expires_at": expires_at,
+            "variants": variants,
+            "port": port,
         }
     await save_db()
     return {
         "uuid": uid, "label": label, "limit_bytes": limit_bytes, "used_bytes": 0,
         "max_connections": max_conn, "active": True, "created_at": LINKS[uid]["created_at"],
         "expires_at": expires_at,
-        "vless_link": generate_vless_link(uid, remark=f"Luffy-{label}", port=DEFAULT_PORT),
+        "variants": variants, "port": port,
+        "vless_links": links_for_all_variants(LINKS[uid], uid),
     }
 
 @app.get("/api/links")
@@ -1633,8 +1875,10 @@ async def list_links(_=Depends(require_auth)):
             "active": data["active"],
             "created_at": data["created_at"],
             "expires_at": data.get("expires_at"),
+            "variants": sanitize_variants(data.get("variants")),
+            "port": data.get("port", DEFAULT_PORT),
             "current_connections": await count_connections_for_link(uid),
-            "vless_link": generate_vless_link(uid, remark=f"Luffy-{data['label']}", port=DEFAULT_PORT),
+            "vless_links": links_for_all_variants(data, uid),
         })
     result.sort(key=lambda x: x["created_at"], reverse=True)
     return {"links": result}
@@ -1660,6 +1904,12 @@ async def toggle_link(uid: str, request: Request, _=Depends(require_auth)):
         if "max_connections" in body:
             mc = int(body["max_connections"] or 0)
             LINKS[uid]["max_connections"] = mc if mc >= 0 else 0
+        variant_keys = ("vless_enabled", "vless_transport", "vless_fingerprint", "vless_alpn",
+                        "trojan_enabled", "trojan_transport", "trojan_fingerprint", "trojan_alpn")
+        if any(k in body for k in variant_keys):
+            LINKS[uid]["variants"] = variants_from_body(body, base=sanitize_variants(LINKS[uid].get("variants")))
+        # پورت همیشه 443 است — دیگه از ورودی کاربر خونده نمی‌شه
+        LINKS[uid]["port"] = DEFAULT_PORT
         if "days_valid" in body:
             try:
                 dv = int(body["days_valid"])
@@ -1717,6 +1967,47 @@ async def delete_address(index: int, _=Depends(require_auth)):
             raise HTTPException(status_code=404, detail="Address not found")
     await save_db()
     return {"ok": True, "addresses": list(CUSTOM_ADDRESSES)}
+
+# فایل‌های آماده‌ی IP که کنار main.py قرار می‌گیرن و با یک کلیک، همه‌شون یکجا
+# (بدون رفت‌وبرگشت جدا برای هر آی‌پی) به لیست Clean IP اضافه می‌شن.
+IP_IMPORT_FILES = {
+    "railway": "railway_ips.txt",
+}
+
+def _parse_ip_file(path: str) -> list[str]:
+    if not os.path.isfile(path):
+        return []
+    out = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if re.match(r'^[a-zA-Z0-9\-_.:/ ]+$', line):
+                out.append(line)
+    return out
+
+@app.post("/api/addresses/import/{source}")
+async def import_addresses(source: str, _=Depends(require_auth)):
+    """همه‌ی آی‌پی‌های داخل railway_ips.txt رو یکجا (بدون تاخیر
+    برای هرکدوم جدا) به لیست Clean IP اضافه می‌کنه."""
+    filename = IP_IMPORT_FILES.get(source)
+    if not filename:
+        raise HTTPException(status_code=404, detail="unknown import source")
+    file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+    ips = _parse_ip_file(file_path)
+    if not ips:
+        raise HTTPException(status_code=404, detail=f"{filename} not found or empty next to main.py")
+    added = 0
+    async with CUSTOM_ADDRESSES_LOCK:
+        existing = set(CUSTOM_ADDRESSES)
+        for ip in ips:
+            if ip not in existing:
+                CUSTOM_ADDRESSES.append(ip)
+                existing.add(ip)
+                added += 1
+    await save_db()
+    return {"ok": True, "added": added, "total_in_file": len(ips), "addresses": list(CUSTOM_ADDRESSES)}
 
 # ── Notifications API ────────────────────────────────────────────────────
 
@@ -1817,9 +2108,9 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         if exp_dt:
             expiry_date_str = exp_dt.strftime("%d %b %Y").upper()
 
-    configs = [generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT)]
-    for i, addr in enumerate(addresses):
-        configs.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
+    configs = links_for_all_variants(link, uid)
+    for addr in addresses:
+        configs.extend(links_for_all_variants(link, uid, address=addr))
 
     # Sub URL for QR
     sub_url = f"https://{get_domain()}/sub/{uid}"
@@ -2327,6 +2618,25 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
         }});
     }}
 
+    // از خودِ رشته‌ی share-link (vless:// یا trojan://) نوع پروتکل/ترابرد/امنیت واقعی رو تشخیص می‌ده
+    function configBadge(cfg) {{
+        try {{
+            const scheme = cfg.split('://')[0].toUpperCase();
+            const qIdx = cfg.indexOf('?');
+            const hIdx = cfg.indexOf('#');
+            const query = cfg.substring(qIdx + 1, hIdx === -1 ? undefined : hIdx);
+            const params = new URLSearchParams(query);
+            const type = (params.get('type') || 'ws').toLowerCase();
+            const mode = (params.get('mode') || '').toLowerCase();
+            const security = (params.get('security') || '').toLowerCase();
+            let transportLabel = type === 'xhttp' ? ('XHTTP' + (mode ? ' (' + mode + ')' : '')) : type.toUpperCase();
+            let secLabel = security === 'tls' ? 'TLS' : (security ? security.toUpperCase() : '');
+            return [scheme, transportLabel, secLabel].filter(Boolean).join(' · ');
+        }} catch (e) {{
+            return 'VLESS · WS · TLS';
+        }}
+    }}
+
     // Render configs
     function renderConfigs() {{
         const list = document.getElementById('config-list');
@@ -2339,7 +2649,7 @@ def generate_landing_page(link: dict, uid: str, addresses: list[str]) -> str:
                     <div class="config-icon">🌐</div>
                     <div class="config-info">
                         <div class="config-name">${{remark}}</div>
-                        <div class="config-type">VLESS · WS · TLS <span class="ping-badge" id="ping-badge-${{i}}">-</span></div>
+                        <div class="config-type">${{configBadge(cfg)}} <span class="ping-badge" id="ping-badge-${{i}}">-</span></div>
                     </div>
                     <div class="config-actions">
                         <button class="btn-copy" onclick="copyConfig('${{cfg.replace(/'/g,"\\'")}}')" title="Copy">Copy</button>
@@ -2450,11 +2760,10 @@ def generate_subscription_content(link: dict, uid: str, addresses: list[str]) ->
     else:
         expiry_str = f"{secs_left // 86400} Days Left"
     
-    links_out = []
-    links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}", port=DEFAULT_PORT))
-    for i, addr in enumerate(addresses):
-        links_out.append(generate_vless_link(uid, remark=f"Luffy-{link['label']}-IP{i+1}", address=addr, port=DEFAULT_PORT))
-            
+    links_out = links_for_all_variants(link, uid)
+    for addr in addresses:
+        links_out.extend(links_for_all_variants(link, uid, address=addr))
+
     return "\n".join(links_out)
 
 
@@ -2479,7 +2788,7 @@ def generate_singbox_config(link: dict, uid: str, addresses: list[str]) -> str:
             },
             "transport": {
                 "type": "ws",
-                "path": f"/ws/{uid}?ed=2048",
+                "path": f"/ws/vless/{uid}?ed=2048",
                 "headers": {"Host": domain},
             },
         }
@@ -2523,27 +2832,45 @@ def generate_clash_config(link: dict, uid: str, addresses: list[str]) -> str:
     else:
         expiry_str = f"{secs_left // 86400} Days Left"
 
-    def _proxy_entry(name: str, server: str, port: int = DEFAULT_PORT) -> str:
+    variants = sanitize_variants(link.get("variants"))
+
+    def _proxy_entry(auth: str, fp: str, name: str, server: str, port: int = DEFAULT_PORT) -> str:
+        # نکته: این خروجی کلش فقط ترابرد WS رو پوشش می‌ده؛ برای لینک‌های XHTTP از
+        # همون لینک share (vless:// یا trojan://) استفاده کن.
+        cred_line = f'    uuid: {uid}\n' if auth == "vless" else f'    password: {uid}\n'
         return (
             f'  - name: "{name}"\n'
-            f'    type: vless\n'
+            f'    type: {auth}\n'
             f'    server: {server}\n'
             f'    port: {port}\n'
-            f'    uuid: {uid}\n'
+            f'{cred_line}'
             f'    tls: true\n'
+            f'    servername: {domain}\n'
+            f'    client-fingerprint: {fp}\n'
             f'    network: ws\n'
-            f'    ws-path: /ws/{uid}\n'
+            f'    ws-path: /ws/{auth}/{uid}\n'
             f'    ws-headers:\n'
             f'      Host: {domain}\n'
         )
 
+    # فقط auth هایی که فعالن و ترابردشون ws هست رو کلش می‌سازیم (محدودیت خودِ این export)
+    active_auths = [a for a in AUTH_TYPES if variants[a]["enabled"] and variants[a]["transport"] == "ws"]
+
     proxies = []
-    proxies.append(_proxy_entry(f"Luffy-{link['label']}", domain))
-    for i, addr in enumerate(addresses):
-        proxies.append(_proxy_entry(f"Luffy-{link['label']}-IP{i+1}", addr))
+    proxy_name_list = []
+    for auth in active_auths:
+        fp = variants[auth]["fingerprint"]
+        suffix = "" if len(active_auths) == 1 else f"-{auth.upper()}"
+        name0 = f"Luffy-{link['label']}{suffix}"
+        proxies.append(_proxy_entry(auth, fp, name0, domain))
+        proxy_name_list.append(name0)
+        for i, addr in enumerate(addresses):
+            name_i = f"Luffy-{link['label']}{suffix}-IP{i+1}"
+            proxies.append(_proxy_entry(auth, fp, name_i, addr))
+            proxy_name_list.append(name_i)
 
     proxies_yaml = "\n".join(proxies)
-    proxy_names = "\n".join(f'      - "{p}"' for p in [f"Luffy-{link['label']}"] + [f"Luffy-{link['label']}-IP{i+1}" for i in range(len(addresses))])
+    proxy_names = "\n".join(f'      - "{p}"' for p in proxy_name_list)
 
     return (
         f"# Luffy Panel - {link['label']}\n"
@@ -2690,6 +3017,53 @@ async def parse_vless_header(first_chunk: bytes):
         raise ValueError(f"unknown address type: {addr_type}")
     return command, address, port, first_chunk[pos:]
 
+async def parse_trojan_header(first_chunk: bytes):
+    """پارس هدر Trojan: hex(SHA224(password))[56] + CRLF + (CMD+ATYP+DST.ADDR+DST.PORT) + CRLF + payload.
+    مقدار hash پسورد اعتبارسنجی نمی‌شه چون احراز هویت واقعی همون uid مخفیِ توی
+    مسیر URL هست (دقیقاً مثل رفتار فعلیِ پنل برای VLESS)."""
+    if len(first_chunk) < 56 + 2 + 1 + 1 + 2 + 2:
+        raise ValueError("chunk too small")
+    pos = 56
+    if first_chunk[pos:pos + 2] != b"\r\n":
+        raise ValueError("invalid trojan header (missing CRLF after hash)")
+    pos += 2
+    command = first_chunk[pos]
+    pos += 1
+    addr_type = first_chunk[pos]
+    pos += 1
+    if addr_type == 1:
+        addr_bytes = first_chunk[pos:pos + 4]
+        pos += 4
+        address = ".".join(str(b) for b in addr_bytes)
+    elif addr_type == 3:
+        domain_len = first_chunk[pos]
+        pos += 1
+        address = first_chunk[pos:pos + domain_len].decode("utf-8", errors="ignore")
+        pos += domain_len
+    elif addr_type == 4:
+        addr_bytes = first_chunk[pos:pos + 16]
+        pos += 16
+        address = ":".join(f"{addr_bytes[i]:02x}{addr_bytes[i+1]:02x}" for i in range(0, 16, 2))
+    else:
+        raise ValueError(f"unknown trojan address type: {addr_type}")
+    port = int.from_bytes(first_chunk[pos:pos + 2], "big")
+    pos += 2
+    if first_chunk[pos:pos + 2] != b"\r\n":
+        raise ValueError("invalid trojan header (missing trailing CRLF)")
+    pos += 2
+    return command, address, port, first_chunk[pos:]
+
+async def parse_proxy_header(auth: str, first_chunk: bytes):
+    """بر اساس auth گرفته‌شده از مسیر URL (vless یا trojan)، هدر رو با پارسر درست می‌خونه."""
+    if auth == "trojan":
+        return await parse_trojan_header(first_chunk)
+    return await parse_vless_header(first_chunk)
+
+def response_prefix_for_protocol(auth: str) -> bytes:
+    """VLESS یک پاسخ ۲ بایتی (version=0 + no addons) قبل از اولین چانک دیتای برگشتی
+    می‌فرسته؛ Trojan چنین چیزی نداره و کاملاً raw pass-through هست."""
+    return b"" if auth == "trojan" else b"\x00\x00"
+
 async def check_quota(uid: str, extra_bytes: int) -> bool:
     async with LINKS_LOCK:
         link = LINKS.get(uid)
@@ -2765,7 +3139,7 @@ async def ws_to_tcp(websocket, writer, conn_id, link_uid):
         except Exception:
             pass
 
-async def tcp_to_ws(websocket, reader, conn_id, link_uid):
+async def tcp_to_ws(websocket, reader, conn_id, link_uid, resp_prefix: bytes = b"\x00\x00"):
     first = True
     try:
         while True:
@@ -2784,20 +3158,28 @@ async def tcp_to_ws(websocket, reader, conn_id, link_uid):
             hourly_traffic[now.strftime("%Y-%m-%d %H:00")] += size
             daily_traffic[now.strftime("%Y-%m-%d")] += size
             try:
-                await websocket.send_bytes((b"\x00\x00" + data) if first else data)
+                await websocket.send_bytes((resp_prefix + data) if (first and resp_prefix) else data)
                 first = False
             except Exception:
                 break
     except Exception:
         pass
 
-@app.websocket("/ws/{uuid}")
-async def websocket_tunnel(websocket: WebSocket, uuid: str):
+@app.websocket("/ws/{auth}/{uuid}")
+async def websocket_tunnel(websocket: WebSocket, auth: str, uuid: str):
     await ensure_default_link()
+
+    if auth not in AUTH_TYPES:
+        await websocket.close(code=1008)
+        return
 
     async with LINKS_LOCK:
         link_data = LINKS.get(uuid)
         if link_data is None or not link_data["active"]:
+            await websocket.close(code=1008)
+            return
+        variant = link_data.get("variants", {}).get(auth)
+        if not variant or not variant.get("enabled") or variant.get("transport") != "ws":
             await websocket.close(code=1008)
             return
         max_conn = link_data.get("max_connections", 0)
@@ -2844,9 +3226,9 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                 return
 
         try:
-            command, address, port, initial_payload = await parse_vless_header(first_chunk)
+            command, address, port, initial_payload = await parse_proxy_header(auth, first_chunk)
         except ValueError as e:
-            logger.warning(f"Invalid VLESS header: {e}")
+            logger.warning(f"Invalid proxy header: {e}")
             await websocket.close(code=1008, reason="invalid header")
             return
 
@@ -2909,7 +3291,7 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                 pass
 
         task_up = asyncio.create_task(ws_to_tcp(websocket, writer, conn_id, uuid))
-        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid))
+        task_down = asyncio.create_task(tcp_to_ws(websocket, reader, conn_id, uuid, resp_prefix=response_prefix_for_protocol(auth)))
         done, pending = await asyncio.wait({task_up, task_down}, return_when=asyncio.FIRST_COMPLETED)
         for t in pending:
             t.cancel()
@@ -2962,6 +3344,12 @@ async def websocket_tunnel(websocket: WebSocket, uuid: str):
                     label = LINKS.get(info.get("uuid"), {}).get("label", info.get("uuid", uuid))
                 extra = f"duration {duration_s}s, {_fmt_bytes(info.get('bytes', 0))}"
                 await _log_connection_event("disconnect", label, info.get("uuid", uuid), info.get("ip", client_ip), extra)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# XHTTP transport (packet-up / stream-up) — جدا شده به xhttp_transport.py
+# ══════════════════════════════════════════════════════════════════════════════
+from xhttp_transport import router as xhttp_router
+app.include_router(xhttp_router)
 
 # ── HTML Panel (Gold/Neon Theme) ─────────────────────────────────────────
 PANEL_HTML = r"""<!DOCTYPE html>
@@ -3515,13 +3903,14 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     <section class="page" id="page-addresses">
       <div class="page-header">
         <div><div class="page-title" data-en="Clean IP" data-fa="آی‌پی تمیز">Clean IP</div><div class="page-sub" data-en="Subscription alternative addresses" data-fa="آدرس‌های جایگزین اشتراک">Subscription alternative addresses</div></div>
-        <div style="display:flex;gap:6px">
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button class="btn btn-ghost" onclick="importAddrs('railway')" data-en="🚄 Railway IP" data-fa="🚄 آی‌پی ریلوی">🚄 Railway IP</button>
           <button class="btn btn-danger" onclick="delAllAddrs()" data-en="Delete All" data-fa="پاک کردن همه">Delete All</button>
           <button class="btn btn-gold" onclick="showAddAddrMo()" data-en="+ Add" data-fa="+ افزودن">+ Add</button>
         </div>
       </div>
       <div class="card">
-        <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Default: www.speedtest.net" data-fa="پیش‌فرض: www.speedtest.net">Default: www.speedtest.net</div>
+        <div style="font-size:12px;color:var(--text3);margin-bottom:12px" data-en="Add your own clean IPs or import from Railway/Cloudflare" data-fa="آی‌پی‌های تمیز خودت رو اضافه کن یا از Railway/Cloudflare ایمپورت کن">Add your own clean IPs or import from Railway/Cloudflare</div>
         <div id="addr-list"></div>
       </div>
     </section>
@@ -3615,6 +4004,76 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     </div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="nc" type="number" min="0" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl" data-en="Days Valid" data-fa="روزهای اعتبار">Days Valid</label><input class="fi" id="nd" type="number" min="0" placeholder="0 = No expiry"></div>
+    <div class="fg" style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-top:4px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <input type="checkbox" id="n_vless_enabled" checked style="width:16px;height:16px;accent-color:var(--gold)" onchange="toggleVariantBox('n','vless')">
+        <label for="n_vless_enabled" style="font-weight:700;cursor:pointer">VLESS</label>
+      </div>
+      <div id="n_vless_box">
+        <div class="fr">
+          <div class="fg">
+            <label class="fl" data-en="Transport" data-fa="ترابرد">Transport</label>
+            <select class="fs" id="n_vless_transport" onchange="syncAlpnDefault('vless','n_vless_transport','n_vless_alpn')">
+              <option value="ws">WebSocket</option>
+              <option value="xhttp-packet-up">XHTTP (packet-up)</option>
+              <option value="xhttp-stream-up">XHTTP (stream-up)</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label class="fl" data-en="Fingerprint" data-fa="فینگرپرینت">Fingerprint</label>
+            <select class="fs" id="n_vless_fp">
+              <option value="chrome">chrome</option><option value="firefox">firefox</option><option value="safari">safari</option>
+              <option value="ios">ios</option><option value="android">android</option><option value="edge">edge</option>
+              <option value="360">360</option><option value="qq">qq</option><option value="random">random</option><option value="randomized">randomized</option>
+            </select>
+          </div>
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
+          <select class="fs" id="n_vless_alpn">
+            <option value="h3">h3</option><option value="h2">h2</option><option value="http/1.1">http/1.1</option>
+            <option value="h3,h2,http/1.1">h3,h2,http/1.1</option><option value="h3,h2">h3,h2</option><option value="h2,http/1.1">h2,http/1.1</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="fg" style="border:1px solid var(--border);border-radius:10px;padding:10px 12px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <input type="checkbox" id="n_trojan_enabled" style="width:16px;height:16px;accent-color:var(--gold)" onchange="toggleVariantBox('n','trojan')">
+        <label for="n_trojan_enabled" style="font-weight:700;cursor:pointer">Trojan</label>
+      </div>
+      <div id="n_trojan_box" style="display:none">
+        <div class="fr">
+          <div class="fg">
+            <label class="fl" data-en="Transport" data-fa="ترابرد">Transport</label>
+            <select class="fs" id="n_trojan_transport" onchange="syncAlpnDefault('trojan','n_trojan_transport','n_trojan_alpn')">
+              <option value="ws">WebSocket</option>
+              <option value="xhttp-packet-up">XHTTP (packet-up)</option>
+              <option value="xhttp-stream-up">XHTTP (stream-up)</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label class="fl" data-en="Fingerprint" data-fa="فینگرپرینت">Fingerprint</label>
+            <select class="fs" id="n_trojan_fp">
+              <option value="chrome">chrome</option><option value="firefox">firefox</option><option value="safari">safari</option>
+              <option value="ios">ios</option><option value="android">android</option><option value="edge">edge</option>
+              <option value="360">360</option><option value="qq">qq</option><option value="random">random</option><option value="randomized">randomized</option>
+            </select>
+          </div>
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
+          <select class="fs" id="n_trojan_alpn">
+            <option value="h3">h3</option><option value="h2">h2</option><option value="http/1.1">http/1.1</option>
+            <option value="h3,h2,http/1.1">h3,h2,http/1.1</option><option value="h3,h2">h3,h2</option><option value="h2,http/1.1">h2,http/1.1</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="fg" style="opacity:.6">
+      <label class="fl" data-en="Port" data-fa="پورت">Port</label>
+      <input class="fi" value="443" readonly style="cursor:not-allowed">
+    </div>
     <button class="btn btn-gold" onclick="createLink()" style="width:100%;justify-content:center;margin-top:12px;padding:12px" data-en="CREATE" data-fa="ایجاد">CREATE</button>
   </div>
 </div>
@@ -3631,6 +4090,76 @@ body[dir="rtl"]{direction:rtl;text-align:right}
     </div>
     <div class="fg"><label class="fl" data-en="Max IPs" data-fa="حداکثر آی‌پی">Max IPs</label><input class="fi" id="ec" type="number" min="0" placeholder="0 = ∞"></div>
     <div class="fg"><label class="fl" data-en="Extend Days" data-fa="افزایش روزها">Extend Days</label><input class="fi" id="ed" type="number" min="0" placeholder="0 = no change"></div>
+    <div class="fg" style="border:1px solid var(--border);border-radius:10px;padding:10px 12px;margin-top:4px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <input type="checkbox" id="e_vless_enabled" style="width:16px;height:16px;accent-color:var(--gold)" onchange="toggleVariantBox('e','vless')">
+        <label for="e_vless_enabled" style="font-weight:700;cursor:pointer">VLESS</label>
+      </div>
+      <div id="e_vless_box">
+        <div class="fr">
+          <div class="fg">
+            <label class="fl" data-en="Transport" data-fa="ترابرد">Transport</label>
+            <select class="fs" id="e_vless_transport" onchange="syncAlpnDefault('vless','e_vless_transport','e_vless_alpn')">
+              <option value="ws">WebSocket</option>
+              <option value="xhttp-packet-up">XHTTP (packet-up)</option>
+              <option value="xhttp-stream-up">XHTTP (stream-up)</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label class="fl" data-en="Fingerprint" data-fa="فینگرپرینت">Fingerprint</label>
+            <select class="fs" id="e_vless_fp">
+              <option value="chrome">chrome</option><option value="firefox">firefox</option><option value="safari">safari</option>
+              <option value="ios">ios</option><option value="android">android</option><option value="edge">edge</option>
+              <option value="360">360</option><option value="qq">qq</option><option value="random">random</option><option value="randomized">randomized</option>
+            </select>
+          </div>
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
+          <select class="fs" id="e_vless_alpn">
+            <option value="h3">h3</option><option value="h2">h2</option><option value="http/1.1">http/1.1</option>
+            <option value="h3,h2,http/1.1">h3,h2,http/1.1</option><option value="h3,h2">h3,h2</option><option value="h2,http/1.1">h2,http/1.1</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="fg" style="border:1px solid var(--border);border-radius:10px;padding:10px 12px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <input type="checkbox" id="e_trojan_enabled" style="width:16px;height:16px;accent-color:var(--gold)" onchange="toggleVariantBox('e','trojan')">
+        <label for="e_trojan_enabled" style="font-weight:700;cursor:pointer">Trojan</label>
+      </div>
+      <div id="e_trojan_box" style="display:none">
+        <div class="fr">
+          <div class="fg">
+            <label class="fl" data-en="Transport" data-fa="ترابرد">Transport</label>
+            <select class="fs" id="e_trojan_transport" onchange="syncAlpnDefault('trojan','e_trojan_transport','e_trojan_alpn')">
+              <option value="ws">WebSocket</option>
+              <option value="xhttp-packet-up">XHTTP (packet-up)</option>
+              <option value="xhttp-stream-up">XHTTP (stream-up)</option>
+            </select>
+          </div>
+          <div class="fg">
+            <label class="fl" data-en="Fingerprint" data-fa="فینگرپرینت">Fingerprint</label>
+            <select class="fs" id="e_trojan_fp">
+              <option value="chrome">chrome</option><option value="firefox">firefox</option><option value="safari">safari</option>
+              <option value="ios">ios</option><option value="android">android</option><option value="edge">edge</option>
+              <option value="360">360</option><option value="qq">qq</option><option value="random">random</option><option value="randomized">randomized</option>
+            </select>
+          </div>
+        </div>
+        <div class="fg">
+          <label class="fl" data-en="ALPN" data-fa="ALPN">ALPN</label>
+          <select class="fs" id="e_trojan_alpn">
+            <option value="h3">h3</option><option value="h2">h2</option><option value="http/1.1">http/1.1</option>
+            <option value="h3,h2,http/1.1">h3,h2,http/1.1</option><option value="h3,h2">h3,h2</option><option value="h2,http/1.1">h2,http/1.1</option>
+          </select>
+        </div>
+      </div>
+    </div>
+    <div class="fg" style="opacity:.6">
+      <label class="fl" data-en="Port" data-fa="پورت">Port</label>
+      <input class="fi" value="443" readonly style="cursor:not-allowed">
+    </div>
     <div style="display:flex;gap:10px;margin-top:16px">
       <button class="btn btn-gold" onclick="saveEdit()" style="flex:1;justify-content:center;padding:12px" data-en="SAVE" data-fa="ذخیره">SAVE</button>
       <button class="btn btn-danger" onclick="resetTraf()" style="padding:12px" data-en="Reset" data-fa="بازنشانی">Reset</button>
@@ -3663,6 +4192,13 @@ body[dir="rtl"]{direction:rtl;text-align:right}
 function $(s){return document.querySelector(s)}
 function $m(id){return document.getElementById(id)}
 function esc(s){return String(s).replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function protoBadge(variants){
+  if(!variants)return 'VLESS';
+  const on=[];
+  if(variants.vless&&variants.vless.enabled)on.push('VLESS');
+  if(variants.trojan&&variants.trojan.enabled)on.push('TROJAN');
+  return on.length?on.join('+'):'VLESS';
+}
 
 const langMap={
   en:{edit:'Edit',copy:'Copy',sub:'Sub',qr:'QR',del:'Del',gh:'View on GitHub'},
@@ -3908,7 +4444,7 @@ function renderLinks(links){
   tb.innerHTML=rows.map(r=>`<tr>
     <td style="color:var(--text3);font-size:10.5px">${r.i}</td>
     <td style="font-weight:600">${esc(r.l.label)}</td>
-    <td><span class="tag tag-vless">VLESS</span></td>
+    <td><span class="tag tag-vless">${protoBadge(r.l.variants)}</span></td>
     <td><div class="pill"><span class="pill-used">${fmtB(r.u)}</span><div class="pill-bar"><div class="pill-fill" style="width:${r.pct}%;background:${r.col}"></div></div><span class="pill-lim">${fmtLim(r.lim)}</span></div></td>
     <td style="font-size:11px;font-weight:600;color:${r.mc2>0&&r.cc>=r.mc2?'var(--red)':'var(--text2)'}">${r.cc}/${r.mc2||'∞'}</td>
     <td style="font-size:10.5px;font-weight:700;color:${r.ec}">${r.ex}</td>
@@ -3916,9 +4452,9 @@ function renderLinks(links){
     <td><div style="display:flex;gap:3px;align-items:center;flex-wrap:wrap">
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
       <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
-      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
+      <button class="act-btn act-copy" onclick="cpLink('${esc((r.l.vless_links||[]).join(String.fromCharCode(10)))}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="act-btn act-qr" onclick="showQR('${esc((r.l.vless_links||[])[0]||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div></td>
   </tr>`).join('');
@@ -3928,7 +4464,7 @@ function renderLinks(links){
       <div style="display:flex;align-items:center;gap:7px">
         <span style="font-size:11px;color:var(--text3)">#${r.i}</span>
         <span style="font-weight:600;font-size:14px">${esc(r.l.label)}</span>
-        <span class="tag tag-vless">VLESS</span>
+        <span class="tag tag-vless">${protoBadge(r.l.variants)}</span>
       </div>
       <button class="toggle ${r.l.active?'on':''}" data-uid="${r.l.uuid}" onclick="togLink(this)"></button>
     </div>
@@ -3936,9 +4472,9 @@ function renderLinks(links){
     <div style="font-size:11.5px;color:${r.ec};margin-top:6px;font-weight:600">⏳ ${r.ex} · ${r.cc}/${r.mc2||'∞'} IPs</div>
     <div class="m-card-acts">
       <button class="act-btn act-edit" onclick="showEditMo('${r.l.uuid}')">${editText}</button>
-      <button class="act-btn act-copy" onclick="cpLink('${esc(r.l.vless_link||'')}')">${copyText}</button>
+      <button class="act-btn act-copy" onclick="cpLink('${esc((r.l.vless_links||[]).join(String.fromCharCode(10)))}')">${copyText}</button>
       <button class="act-btn act-sub" onclick="cpSub('${r.l.uuid}')">${subText}</button>
-      <button class="act-btn act-qr" onclick="showQR('${esc(r.l.vless_link||'')}')">${qrText}</button>
+      <button class="act-btn act-qr" onclick="showQR('${esc((r.l.vless_links||[])[0]||'')}')">${qrText}</button>
       <button class="act-btn act-del" onclick="delLink('${r.l.uuid}')">${delText}</button>
     </div>
   </div>`).join('');
@@ -3960,14 +4496,44 @@ async function togLink(el){
 
 function showAddMo(){$m('mo-add').classList.add('show')}
 
+// وقتی transport یک بلاک (vless یا trojan) عوض شد، ALPN همون بلاک رو به پیش‌فرضش ببر
+const ALPN_DEFAULTS={
+  'vless-ws':'http/1.1','vless-xhttp-packet-up':'h2,http/1.1','vless-xhttp-stream-up':'h2,http/1.1',
+  'trojan-ws':'http/1.1','trojan-xhttp-packet-up':'h2,http/1.1','trojan-xhttp-stream-up':'h2,http/1.1',
+};
+function syncAlpnDefault(auth,transportId,alpnId){
+  const key=auth+'-'+$m(transportId).value;
+  $m(alpnId).value=ALPN_DEFAULTS[key]||'http/1.1';
+}
+function toggleVariantBox(prefix,auth){
+  $m(prefix+'_'+auth+'_box').style.display=$m(prefix+'_'+auth+'_enabled').checked?'':'none';
+}
+function readVariantFields(prefix,auth){
+  return {
+    [auth+'_enabled']: $m(prefix+'_'+auth+'_enabled').checked,
+    [auth+'_transport']: $m(prefix+'_'+auth+'_transport').value,
+    [auth+'_fingerprint']: $m(prefix+'_'+auth+'_fp').value,
+    [auth+'_alpn']: $m(prefix+'_'+auth+'_alpn').value,
+  };
+}
+function fillVariantFields(prefix,auth,variant){
+  $m(prefix+'_'+auth+'_enabled').checked=!!(variant&&variant.enabled);
+  $m(prefix+'_'+auth+'_transport').value=(variant&&variant.transport)||'ws';
+  $m(prefix+'_'+auth+'_fp').value=(variant&&variant.fingerprint)||'chrome';
+  $m(prefix+'_'+auth+'_alpn').value=(variant&&variant.alpn)||ALPN_DEFAULTS[auth+'-ws'];
+  toggleVariantBox(prefix,auth);
+}
+
 async function createLink(){
   const label=$m('nl').value.trim()||'New Link';
   if(!/^[a-zA-Z0-9\-_. ]+$/.test(label)){toast('Only English letters allowed',true);return}
+  if(!$m('n_vless_enabled').checked && !$m('n_trojan_enabled').checked){toast('Enable at least one protocol (VLESS or Trojan)',true);return}
   const v=parseFloat($m('nv').value)||0;
   const mc=parseInt($m('nc').value)||0;
   const days=parseInt($m('nd').value)||0;
+  const body=Object.assign({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days},readVariantFields('n','vless'),readVariantFields('n','trojan'));
   try{
-    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,limit_value:v,limit_unit:'GB',max_connections:mc,days_valid:days})});
+    const r=await fetch('/api/links',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!r.ok)throw new Error();
     toast('Created');
     $m('nl').value='';$m('nv').value='';$m('nc').value='';$m('nd').value='';
@@ -3984,16 +4550,20 @@ function showEditMo(uid){
   $m('el').value=l.limit_bytes>0?(l.limit_bytes/1073741824):'';
   $m('ec').value=l.max_connections>0?l.max_connections:'';
   $m('ed').value='';
+  const variants=l.variants||{};
+  fillVariantFields('e','vless',variants.vless);
+  fillVariantFields('e','trojan',variants.trojan);
   $m('et').textContent=(lang==='fa'?'ویرایش: ':'EDIT: ')+l.label;
   $m('mo-edit').classList.add('show');
 }
 
 async function saveEdit(){
   const uid=$m('eu').value;
+  if(!$m('e_vless_enabled').checked && !$m('e_trojan_enabled').checked){toast('Enable at least one protocol (VLESS or Trojan)',true);return}
   const v=parseFloat($m('el').value)||0;
   const mc=parseInt($m('ec').value)||0;
   const days=parseInt($m('ed').value)||0;
-  const body={limit_value:v,limit_unit:'GB',max_connections:mc};
+  const body=Object.assign({limit_value:v,limit_unit:'GB',max_connections:mc},readVariantFields('e','vless'),readVariantFields('e','trojan'));
   if(days>0)body.days_valid=days;
   try{
     const r=await fetch('/api/links/'+uid,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
@@ -4393,6 +4963,18 @@ async function delAllAddrs(){
     if(!r.ok)throw new Error();
     toast('All addresses deleted');await loadAddrs();
   }catch(e){toast('Error deleting',true)}
+}
+
+// همه‌ی آی‌پی‌های railway_ips.txt رو یکجا (یک درخواست، بدون تاخیر
+// به‌ازای هر آی‌پی) به لیست Clean IP اضافه می‌کنه.
+async function importAddrs(source){
+  try{
+    const r=await fetch('/api/addresses/import/'+source,{method:'POST'});
+    const d=await r.json().catch(()=>null);
+    if(!r.ok){toast((d&&d.detail)||'Error importing',true);return}
+    toast((d.added||0)+' address(es) added, '+((d.total_in_file||0)-(d.added||0))+' already existed');
+    await loadAddrs();
+  }catch(e){toast('Error importing',true)}
 }
 
 setTheme(theme);
